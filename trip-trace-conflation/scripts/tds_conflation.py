@@ -23,6 +23,7 @@ import osmnx as ox
 import pandas as pd
 import pyproj
 import shapely.ops
+from shapely.ops import unary_union
 from mappymatch import package_root
 from mappymatch.constructs.geofence import Geofence
 from mappymatch.constructs.trace import Trace
@@ -280,6 +281,72 @@ def process_trace(
         trace_dict["matched_path_gdf"] = matched_path_gdf
 
     return trace_dict
+
+def match_links_from_shapefile(
+    shapefile_path,
+    download_local_OSM_map,
+    geofence_buffer,
+    region_boundary_path,
+    local_network_path,
+    network_type=NetworkType.DRIVE,
+):
+    """
+    Match each feature in a shapefile to the closest OSM path using the same trace matching logic.
+
+    Args:
+        shapefile_path (str or Path): Path to the shapefile containing links (LineString or Point).
+        download_local_OSM_map (bool): Whether to download a local OSM map for each trace.
+        geofence_buffer (int): Buffer distance around each feature.
+        region_boundary_path (Path): Path to region boundary geojson.
+        local_network_path (Path): Path to local network file.
+        network_type: OSMnx network type.
+
+    Returns:
+        List of dicts: Each dict contains the original feature id and the match result.
+    """
+    # if type(shapefile_path == str):
+    #     gdf = gpd.read_file(shapefile_path)
+    # else:
+    #     gdf = shapefile_path
+    gdf = shapefile_path.to_crs("EPSG:4326")
+    results = gpd.GeoDataFrame()
+
+    # Use index as unique id if no id column
+    id_col = "id" if "id" in gdf.columns else gdf.index.name or "index"
+    gdf[id_col] = gdf.index
+
+    for _, row in gdf.iterrows():
+        # If geometry is LineString, extract coordinates; if Point, use as-is
+        if row.geometry.geom_type == "LineString":
+            coords = list(row.geometry.coords)
+            points_gdf = gpd.GeoDataFrame(
+                geometry=[shapely.geometry.Point(x, y) for x, y in coords],
+                crs="EPSG:4326"
+            )
+            trace = Trace.from_geo_dataframe(frame=points_gdf, xy=True)
+        else:
+            continue  # skip unsupported geometry types
+
+        trace_dict = {
+            "trip_id": row[id_col],
+            "trace": trace,  # Pass the Trace object, not the geometry or coords
+            "trace_gdf": gpd.GeoDataFrame(geometry=[row.geometry], crs="EPSG:4326"),
+            "trace_line_gdf": gpd.GeoDataFrame(geometry=[row.geometry], crs="EPSG:4326"),
+        }
+
+        # Use the same matching logic as process_trace
+        match_result = process_trace(
+            trace_dict,
+            download_local_OSM_map=download_local_OSM_map,
+            geofence_buffer=geofence_buffer,
+            network_type=network_type,
+        )
+        # print(match_result.keys())
+        out_gdf = match_result['matched_path_gdf']
+        out_gdf['original_id'] = row[id_col]
+        results = pd.concat([results,out_gdf], ignore_index = True)
+
+    return results
 
 
 def batch_process_traces_parallel(
@@ -550,6 +617,97 @@ def filter_trips(trip_locations):
     return car_trips
 
 
+def flag_trips_by_osmid(matched_traces, osmid_set):
+    """
+    For each trip, check if any link in matched_path_gdf contains an osmid in osmid_set.
+    Returns a list of flagged trip_ids.
+
+    Args:
+        matched_traces (list): List of dicts, each with a 'trip_id' and 'matched_path_gdf'.
+        osmid_set (set): Set of osmids to flag.
+
+    Returns:
+        list: List of trip_ids where any link in matched_path_gdf contains an osmid in osmid_set.
+    """
+    flagged_trip_ids = []
+    for id in matched_traces.trip_id.unique():
+        trip_id = id
+        matched_path_gdf = matched_traces[matched_traces["trip_id"] == trip_id]
+        if matched_path_gdf is not None and "osmid" in matched_path_gdf.columns:
+            # osmid can be a single value or a list; handle both
+            if matched_path_gdf["osmid"].apply(lambda x: any(item in osmid_set for item in (x if isinstance(x, (list, set, tuple)) else [x]))).any():
+                flagged_trip_ids.append(trip_id)
+    return flagged_trip_ids
+
+def _match_line_to_osm(line, edges_df, edge_sindex):
+    """
+    Helper function to match a single line to the nearest OSM edge.
+    """
+    bounds = line.bounds
+    candidate_idxs = list(edge_sindex.intersection(bounds))
+    if not candidate_idxs:
+        return None
+
+    candidates = edges_df.iloc[candidate_idxs]
+    distances = candidates.geometry.distance(line)
+    nearest_idx = distances.idxmin()
+    return candidates.loc[nearest_idx].to_dict()
+
+def conflate_with_osm(shapefile, osm_filter = None,buffer_dist=0.0001, max_workers=4):
+    """
+    Match each input line to the nearest OSM 'drive' network edge using multiprocessing. Input is a shapefile of LineString geometries.
+    Pre-process the input to include the select link geometires you want for the analysis. E.G. express lanes.
+
+    Parameters:
+    - shapefile_path: path to the input shapefile of LineString geometries
+    - buffer_dist: buffer distance (in meters) around shapefile area for OSM network
+    - max_workers: number of processes to use for parallel processing
+
+    Returns:
+    - GeoDataFrame of matched OSM edges
+    """
+
+    # Load and reproject input geometries
+    input_gdf = shapefile#gpd.read_file(shapefile_path).to_crs(epsg=4326)
+
+    # Step 2: Create a polygon around the input lines
+    polygon = unary_union(input_gdf.geometry.buffer(buffer_dist)).convex_hull
+
+    # Step 3: Download OSM street network for the area
+    G = ox.graph_from_polygon(polygon, network_type='drive')
+    edges = ox.graph_to_gdfs(G, nodes=False).to_crs(epsg=3857)
+    # Filter edges based on osm_filter if provided
+    if osm_filter:
+        edges = edges[edges['highway'].isin(osm_filter)]
+    edge_sindex = edges.sindex
+
+    # Project input lines to metric CRS
+    input_gdf = input_gdf.to_crs(epsg=3857)
+    input_lines = input_gdf.geometry
+
+    # Multiprocessing matching
+    matched = []
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_match_line_to_osm, line, edges, edge_sindex) for line in input_lines]
+
+        for future in as_completed(futures):
+            result = future.result()
+            if result is not None:
+                matched.append(result)
+
+    # Create result GeoDataFrame
+    if not matched:
+        print("No matches found.")
+        return gpd.GeoDataFrame(columns=edges.columns, crs=edges.crs)
+
+    result_df = pd.DataFrame(matched)
+    print(result_df.columns)
+    result_gdf = gpd.GeoDataFrame(result_df, geometry='geometry', crs=edges.crs)
+
+    return result_gdf.reset_index(drop=True)
+
+
+
 def main(script_args):
     """Main function to process trip data and write matched traces to a geopackage.
 
@@ -689,7 +847,7 @@ def main(script_args):
     # logging.info("Cache directory deleted.")
 
     logging.info("Processing complete.")
-
+    return matched_traces
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -710,5 +868,22 @@ if __name__ == "__main__":
         "--geofence_buffer", help="Buffer around trace to use", type=int, default=1000
     )
     args = parser.parse_args()
+    
+    
+    select_link = gpd.read_file(config.select_link_shape)
+    select_link = select_link.to_crs("EPSG:4326")
 
+    osm_select = conflate_with_osm(
+        shapefile=select_link, osm_filter=['motorway'],
+        max_workers=8
+    )
+    osm_select.to_file(
+        config.out_file_path / "select_link_matched.shp", driver="ESRI Shapefile"
+    )
+    # osm_select = gpd.read_file(config.out_file_path / "select_link_matched.shp")
     main(script_args=args)
+    matched_traces = gpd.read_file(config.gpkg_path, layer="matched_gdf")
+    select_trips = flag_trips_by_osmid(matched_traces, osm_select['osmid'].to_list())
+    select_trips = pd.DataFrame(select_trips, columns=['trip_id']).to_csv(
+        config.out_file_path / "select_trips.csv", index=False
+    )

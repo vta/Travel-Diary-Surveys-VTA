@@ -5,13 +5,13 @@ location_tbl = "location.csv"
 trip_tbl = "trip.csv"
 
 # M directory for survey work
-M_survey_data_dir = pathlib.Path("M:\\Data\\HomeInterview\\Bay Area Travel Study 2023\\Data")
+M_survey_data_dir = pathlib.Path(r"C:\Users\Carson_H\Santa Clara Valley Transportation Authority\ModelingGIS - ModelingGIS Document Library\Surveys\BATS2023_data\weightedDataset_02212025\WeightedDataset_02212025")
 
 # Define input file paths
 location_path = (
-    M_survey_data_dir / "Full Weighted 2023 Dataset" / "WeightedDataset_08092024" / location_tbl
+    M_survey_data_dir /  location_tbl
 )
-trip_path = M_survey_data_dir / "Full Weighted 2023 Dataset" / "WeightedDataset_08092024" / trip_tbl
+trip_path = M_survey_data_dir / trip_tbl
 
 region_boundary_path = (
     M_survey_data_dir
@@ -27,7 +27,8 @@ local_network_path = (
 )
 
 # Define output file paths
-out_file_path = (
-    M_survey_data_dir / "Full Weighted 2023 Dataset" / "WeightedDataset_08092024" / "OSM_match_v2"
-)
+out_file_path =     pathlib.Path(r"C:\Users\Carson_H\OneDrive - Santa Clara Valley Transportation Authority\Documents\BATS\TripTraceConflation")
+
 gpkg_path = out_file_path / "tds_conflation_results.gpkg"
+
+select_link_shape = r"C:\Users\Carson_H\OneDrive - Santa Clara Valley Transportation Authority\Documents\BATS\ExpressLaneAnalysis\GIS\2025_managed_lane.shp"
