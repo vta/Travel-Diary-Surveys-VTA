@@ -629,14 +629,13 @@ def flag_trips_by_osmid(matched_traces, osmid_set):
     Returns:
         list: List of trip_ids where any link in matched_path_gdf contains an osmid in osmid_set.
     """
-    flagged_trip_ids = []
-    for id in matched_traces.trip_id.unique():
-        trip_id = id
-        matched_path_gdf = matched_traces[matched_traces["trip_id"] == trip_id]
-        if matched_path_gdf is not None and "osmid" in matched_path_gdf.columns:
-            # osmid can be a single value or a list; handle both
-            if matched_path_gdf["osmid"].apply(lambda x: any(item in osmid_set for item in (x if isinstance(x, (list, set, tuple)) else [x]))).any():
-                flagged_trip_ids.append(trip_id)
+    # Ensure osmid is always a list for each row
+    matched_traces = matched_traces.copy()
+    matched_traces["osmid"] = matched_traces["osmid"].apply(lambda x: x if isinstance(x, (list, set, tuple)) else [x])
+    # Explode so each osmid is its own row
+    exploded = matched_traces.explode("osmid")
+    # Find trip_ids where osmid is in osmid_set
+    flagged_trip_ids = exploded.loc[exploded["osmid"].isin(osmid_set), "trip_id"].unique().tolist()
     return flagged_trip_ids
 
 def _match_line_to_osm(line, edges_df, edge_sindex):
@@ -868,7 +867,8 @@ if __name__ == "__main__":
         "--geofence_buffer", help="Buffer around trace to use", type=int, default=1000
     )
     args = parser.parse_args()
-    
+    #nx_map_from_geojson(local_network_path=config.local_network_path, geojson_path=config.region_boundary_path, network_type=NetworkType.DRIVE)
+    # # Uncomment this to run the select link matching
     
     select_link = gpd.read_file(config.select_link_shape)
     select_link = select_link.to_crs("EPSG:4326")
